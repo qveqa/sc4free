@@ -145,19 +145,43 @@ function migrateLegacyJson(app) {
   let downloadDirectory = path.join(app.getPath('music'), 'SoundCloudOffline');
   try {
     const row = stmts.insertSettingRow.get();
-    if (row) downloadDirectory = JSON.parse(row.value);
+    if (row) {
+      const parsed = JSON.parse(row.value);
+      if (typeof parsed === 'string' && parsed.length < 1024) downloadDirectory = parsed;
+    }
   } catch (e) {}
 
-  const legacyPath = path.join(downloadDirectory, 'downloads.json');
+  let legacyPath;
+  try {
+    if (typeof downloadDirectory !== 'string') return;
+    legacyPath = path.join(downloadDirectory, 'downloads.json');
+  } catch { return; }
   if (!fs.existsSync(legacyPath)) return;
 
   try {
     console.log('Migrating legacy downloads.json to SQLite...');
-    const legacyTracks = JSON.parse(fs.readFileSync(legacyPath, 'utf8'));
+    const raw = fs.readFileSync(legacyPath, 'utf8');
+    if (raw.length > 5 * 1024 * 1024) throw new Error('legacy file too large');
+    const legacyTracks = JSON.parse(raw);
+    if (!Array.isArray(legacyTracks) || legacyTracks.length > 10000) throw new Error('invalid legacy format');
     const insert = db.prepare(`INSERT OR IGNORE INTO tracks (id, title, artist, fileName, coverName, duration, downloadedAt) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const isSafeName = (n) => typeof n === 'string' && n.length < 256 && !n.includes('\0') && !n.includes('..') && !n.includes('/') && !n.includes('\\') && !path.isAbsolute(n);
     db.transaction(() => {
       for (const t of legacyTracks) {
-        insert.run(t.id, t.title, t.artist, t.fileName, t.coverName || null, t.duration || 0, t.downloadedAt || Date.now());
+        if (!t || typeof t !== 'object') continue;
+        if (!/^\d{1,20}$/.test(String(t.id || ''))) continue;
+        if (typeof t.title !== 'string' || typeof t.artist !== 'string') continue;
+        if (!isSafeName(t.fileName)) continue;
+        if (t.coverName && !isSafeName(t.coverName)) continue;
+        insert.run(
+          String(t.id),
+          String(t.title).slice(0, 300),
+          String(t.artist).slice(0, 300),
+          t.fileName,
+          t.coverName || null,
+          Number.isFinite(Number(t.duration)) ? Number(t.duration) : 0,
+          Number.isFinite(Number(t.downloadedAt)) ? Number(t.downloadedAt) : Date.now()
+        );
       }
     })();
     fs.renameSync(legacyPath, legacyPath + '.migrated');
@@ -262,10 +286,18 @@ function deleteTrack(id) {
 // DOWNLOAD TASKS
 function saveDownloadTask(task) {
   try {
+    if (!task || !/^\d{1,20}$/.test(String(task.id || ''))) return;
+    const transStr = JSON.stringify(task.transcodings || []);
+    if (transStr.length > 20000) return;
     stmts.saveTask.run(
-      task.id, task.title, task.artist, task.artwork_url,
-      JSON.stringify(task.transcodings || []),
-      task.status, task.progress || 0, task.error || null,
+      String(task.id),
+      String(task.title || '').slice(0, 300),
+      String(task.artist || '').slice(0, 300),
+      typeof task.artwork_url === 'string' ? task.artwork_url.slice(0, 2048) : '',
+      transStr,
+      ['queued', 'downloading', 'transcoding', 'tagging', 'completed', 'failed', 'cancelled'].includes(task.status) ? task.status : 'queued',
+      Number.isFinite(Number(task.progress)) ? Math.max(0, Math.min(100, Number(task.progress))) : 0,
+      typeof task.error === 'string' ? task.error.slice(0, 1000) : null,
       task.created_at || Date.now(), Date.now()
     );
   } catch (e) {
@@ -275,18 +307,25 @@ function saveDownloadTask(task) {
 
 function getDownloadTasks() {
   try {
-    return stmts.getTasks.all().map(r => ({
-      trackId: r.id,
-      title: r.title,
-      artist: r.artist,
-      artworkUrl: r.artwork_url,
-      transcodings: JSON.parse(r.transcodings || '[]'),
-      status: r.status,
-      progress: r.progress,
-      error: r.error,
-      created_at: r.created_at,
-      updated_at: r.updated_at
-    }));
+    return stmts.getTasks.all().map(r => {
+      let trans = [];
+      try {
+        const parsed = JSON.parse(r.transcodings || '[]');
+        if (Array.isArray(parsed)) trans = parsed.slice(0, 10);
+      } catch (_) {}
+      return {
+        trackId: r.id,
+        title: r.title,
+        artist: r.artist,
+        artworkUrl: r.artwork_url,
+        transcodings: trans,
+        status: r.status,
+        progress: r.progress,
+        error: r.error,
+        created_at: r.created_at,
+        updated_at: r.updated_at
+      };
+    });
   } catch (e) {
     console.error('getDownloadTasks:', e);
     return [];
@@ -304,8 +343,10 @@ function deleteDownloadTask(id) {
 // USER PLAYLISTS
 function createPlaylist(name) {
   try {
-    const info = stmts.createPlaylist.run(String(name).trim().slice(0, 120), Date.now());
-    return { id: Number(info.lastInsertRowid), name, track_count: 0 };
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > 120) return null;
+    const clean = String(name).trim().slice(0, 120);
+    const info = stmts.createPlaylist.run(clean, Date.now());
+    return { id: Number(info.lastInsertRowid), name: clean, track_count: 0 };
   } catch (e) {
     console.error('createPlaylist:', e);
     return null;
@@ -314,7 +355,10 @@ function createPlaylist(name) {
 
 function renamePlaylist(id, name) {
   try {
-    stmts.renamePlaylist.run(String(name).trim().slice(0, 120), id);
+    const pid = Number(id);
+    if (!Number.isInteger(pid) || pid <= 0 || pid > 1000000) return false;
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > 120) return false;
+    stmts.renamePlaylist.run(String(name).trim().slice(0, 120), pid);
     return true;
   } catch (e) {
     console.error('renamePlaylist:', e);
@@ -324,7 +368,9 @@ function renamePlaylist(id, name) {
 
 function deletePlaylist(id) {
   try {
-    stmts.deletePlaylist.run(id);
+    const pid = Number(id);
+    if (!Number.isInteger(pid) || pid <= 0 || pid > 1000000) return false;
+    stmts.deletePlaylist.run(pid);
     return true;
   } catch (e) {
     console.error('deletePlaylist:', e);
@@ -343,7 +389,9 @@ function getUserPlaylists() {
 
 function getUserPlaylistById(id) {
   try {
-    return stmts.getPlaylistById.get(id) || null;
+    const pid = Number(id);
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    return stmts.getPlaylistById.get(pid) || null;
   } catch (e) {
     return null;
   }
@@ -351,16 +399,24 @@ function getUserPlaylistById(id) {
 
 function addTrackToPlaylist(playlistId, track) {
   try {
-    const posRow = stmts.nextPlaylistPos.get(playlistId);
+    const pid = Number(playlistId);
+    if (!Number.isInteger(pid) || pid <= 0 || pid > 1000000) return false;
+    if (!track || !/^\d{1,20}$/.test(String(track.trackId || ''))) return false;
+    const title = String(track.title || '').slice(0, 300);
+    const artist = String(track.artist || '').slice(0, 300);
+    if (!title || !artist) return false;
+    const transStr = JSON.stringify(track.transcodings || []);
+    if (transStr.length > 20000) return false;
+    const posRow = stmts.nextPlaylistPos.get(pid);
     const position = posRow ? posRow.pos : 0;
     const info = stmts.addPlaylistTrack.run(
-      playlistId,
+      pid,
       String(track.trackId),
-      track.title || '',
-      track.artist || '',
-      track.artworkUrl || '',
-      JSON.stringify(track.transcodings || []),
-      track.duration || 0,
+      title,
+      artist,
+      typeof track.artworkUrl === 'string' ? track.artworkUrl.slice(0, 2048) : '',
+      transStr,
+      Number(track.duration) || 0,
       position,
       Date.now()
     );
@@ -373,7 +429,10 @@ function addTrackToPlaylist(playlistId, track) {
 
 function removeTrackFromPlaylist(playlistId, trackId) {
   try {
-    stmts.removePlaylistTrack.run(playlistId, String(trackId));
+    const pid = Number(playlistId);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    if (!/^\d{1,20}$/.test(String(trackId || ''))) return false;
+    stmts.removePlaylistTrack.run(pid, String(trackId));
     return true;
   } catch (e) {
     console.error('removeTrackFromPlaylist:', e);
@@ -383,7 +442,9 @@ function removeTrackFromPlaylist(playlistId, trackId) {
 
 function getUserPlaylistTracks(playlistId) {
   try {
-    return stmts.getPlaylistTracks.all(playlistId).map(r => ({
+    const pid = Number(playlistId);
+    if (!Number.isInteger(pid) || pid <= 0) return [];
+    return stmts.getPlaylistTracks.all(pid).map(r => ({
       trackId: r.track_id,
       title: r.title,
       artist: r.artist,

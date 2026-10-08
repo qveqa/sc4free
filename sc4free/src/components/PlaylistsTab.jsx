@@ -2,10 +2,14 @@ import React, { useState, useEffect, useCallback, useRef, memo } from 'react';
 import MyPlaylistsView from './MyPlaylistsView.jsx';
 import AddToPlaylist from './AddToPlaylist.jsx';
 
-// High-res cover URL helper
+// High-res cover URL helper — SECURITY FIX: allow https only (block javascript:/data:).
 const getHighResCover = (url) => {
-  if (!url) return 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
-  return url.replace('http://', 'https://').replace('-large.jpg', '-t500x500.jpg');
+  const PLACEHOLDER = 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
+  if (!url || typeof url !== 'string') return PLACEHOLDER;
+  let u = url;
+  if (u.startsWith('http://')) u = 'https://' + u.slice('http://'.length);
+  if (!u.startsWith('https://') || u.includes('\0') || u.length > 2048) return PLACEHOLDER;
+  return u.replace('-large.jpg', '-t500x500.jpg');
 };
 
 // Memoised playlist card

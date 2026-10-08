@@ -2,12 +2,17 @@ import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
 import AddToPlaylist from './AddToPlaylist.jsx';
 
 // Memoized card prevents re-renders when only isPlaying/currentTrack change in the parent
+const PLACEHOLDER_ART = 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
+function sanitizeArtworkUrl(url) {
+  if (!url || typeof url !== 'string') return PLACEHOLDER_ART;
+  let u = url;
+  if (u.startsWith('http://')) u = 'https://' + u.slice('http://'.length);
+  if (!u.startsWith('https://')) return PLACEHOLDER_ART;
+  if (u.includes('\0') || u.length > 2048) return PLACEHOLDER_ART;
+  return u.replace('-large.jpg', '-t500x500.jpg');
+}
 const TrackCard = memo(function TrackCard({ track, isCurrent, showPause, isDownloading, onPlay, onDownload }) {
-  const coverUrl = (() => {
-    const url = track.artwork_url || track.user?.avatar_url;
-    if (!url) return 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
-    return url.replace('http://', 'https://').replace('-large.jpg', '-t500x500.jpg');
-  })();
+  const coverUrl = sanitizeArtworkUrl(track.artwork_url || track.user?.avatar_url);
 
   const playlistTrack = {
     trackId: String(track.id),
@@ -117,9 +122,7 @@ export default function SearchTab({ onPlayTrack, downloadsInProgress, currentTra
   }, [query]);
 
   const getHighResCover = useCallback((track) => {
-    const url = track.artwork_url || track.user?.avatar_url;
-    if (!url) return 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
-    return url.replace('http://', 'https://').replace('-large.jpg', '-t500x500.jpg');
+    return sanitizeArtworkUrl(track.artwork_url || track.user?.avatar_url);
   }, []);
 
   const handleDownload = useCallback((track) => {

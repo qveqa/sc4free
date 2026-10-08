@@ -14,9 +14,13 @@ function getCoverUrl(track) {
   if (track.coverPath) {
     return `media://path/${encodeURIComponent(track.coverPath.replace(/\\/g, '/'))}`;
   }
+  const PLACEHOLDER = 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
   const raw = track.artwork_url || track.user?.avatar_url;
-  if (raw) return raw.replace('http://', 'https://').replace('-large.jpg', '-t500x500.jpg');
-  return 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
+  if (!raw || typeof raw !== 'string') return PLACEHOLDER;
+  let u = raw;
+  if (u.startsWith('http://')) u = 'https://' + u.slice('http://'.length);
+  if (!u.startsWith('https://') || u.includes('\0') || u.length > 2048) return PLACEHOLDER;
+  return u.replace('-large.jpg', '-t500x500.jpg');
 }
 
 // ─── Slider ──────────────────────────────────────────────────────────────────

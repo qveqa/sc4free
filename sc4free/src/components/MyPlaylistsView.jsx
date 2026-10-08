@@ -5,8 +5,11 @@ const PLACEHOLDER = 'https://a-v2.sndcdn.com/assets/images/default/placeholder-a
 
 function playlistCover(pl) {
   if (pl.coverPath) return `media://path/${encodeURIComponent(pl.coverPath.replace(/\\/g, '/'))}`;
-  if (pl.cover_url) return pl.cover_url.replace('http://', 'https://').replace('-large.jpg', '-t500x500.jpg');
-  return PLACEHOLDER;
+  if (!pl.cover_url || typeof pl.cover_url !== 'string') return PLACEHOLDER;
+  let u = pl.cover_url;
+  if (u.startsWith('http://')) u = 'https://' + u.slice('http://'.length);
+  if (!u.startsWith('https://') || u.includes('\0') || u.length > 2048) return PLACEHOLDER;
+  return u.replace('-large.jpg', '-t500x500.jpg');
 }
 
 export default function MyPlaylistsView({ onPlayTrack, currentTrack, isPlaying, onPlayPause, downloadsInProgress }) {

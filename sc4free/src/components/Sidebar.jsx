@@ -107,7 +107,7 @@ export default function Sidebar({ activeTab, setActiveTab, userProfile, onLogout
         {userProfile ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', background: 'rgba(255,255,255,0.03)', padding: '10px', borderRadius: '10px', border: '1px solid var(--border-color)' }}>
             <img
-              src={userProfile.avatar_url || 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png'}
+              src={typeof userProfile.avatar_url === 'string' && userProfile.avatar_url.startsWith('https://') ? userProfile.avatar_url : 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png'}
               alt="Avatar"
               style={{ width: '32px', height: '32px', borderRadius: '50%', objectFit: 'cover' }}
             />

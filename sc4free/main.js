@@ -11,7 +11,7 @@ protocol.registerSchemesAsPrivileged([
       secure: true,
       supportFetchAPI: true,
       stream: true,
-      bypassCSP: true
+      bypassCSP: false
     }
   }
 ]);
@@ -27,8 +27,13 @@ const http = require('http');
 const https = require('https');
 
 // Configure global Axios agent defaults with keepAlive to speed up searches & metadata fetching
+// SECURITY FIX: enforce timeouts, redirect limits and response size caps to prevent DoS/hang.
 axios.defaults.httpAgent = new http.Agent({ keepAlive: true });
 axios.defaults.httpsAgent = new https.Agent({ keepAlive: true });
+axios.defaults.timeout = 15000;
+axios.defaults.maxRedirects = 5;
+axios.defaults.maxContentLength = 50 * 1024 * 1024; // 50 MB
+axios.defaults.maxBodyLength = 10 * 1024 * 1024;
 
 // Import SQLite Database Module
 const db = require('./database.js');
@@ -51,14 +56,110 @@ const ALLOWED_HOSTS = new Set([
 
 function validateUrl(targetUrl) {
   try {
-    if (!targetUrl || !targetUrl.startsWith('https://')) return false;
+    if (typeof targetUrl !== 'string' || !targetUrl.startsWith('https://')) return false;
+    if (targetUrl.includes('\0') || targetUrl.length > 2048) return false;
     const parsed = new URL(targetUrl);
-    const host = parsed.hostname;
+    if (parsed.protocol !== 'https:') return false;
+    if (parsed.username || parsed.password) return false; // block embedded credentials
+    // Block non-default ports to reduce SSRF surface
+    if (parsed.port && parsed.port !== '443') return false;
+    const host = parsed.hostname.toLowerCase();
+    if (!host || host.includes('\0')) return false;
     return ALLOWED_HOSTS.has(host) || 
            host.endsWith('.sndcdn.com') || 
            host.endsWith('.soundcloud.com') || 
            host.endsWith('.soundcloud.cloud');
   } catch (e) {
+    return false;
+  }
+}
+
+// SECURITY FIX: shared validation helpers to prevent path traversal,
+// ID spoofing and IPC payload abuse.
+const TRACK_ID_RE = /^\d{1,20}$/;
+const CLIENT_ID_RE = /^[A-Za-z0-9]{32}$/;
+const TOKEN_RE = /^[A-Za-z0-9\-_]{10,300}$/;
+const WINDOWS_RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+function isValidTrackId(id) {
+  return typeof id === 'string' || typeof id === 'number'
+    ? TRACK_ID_RE.test(String(id))
+    : false;
+}
+
+function isValidClientId(id) {
+  return typeof id === 'string' && CLIENT_ID_RE.test(id);
+}
+
+function isValidTokenFormat(t) {
+  return typeof t === 'string' && TOKEN_RE.test(t.trim());
+}
+
+// Returns true iff `child` resolves inside `parent` (prevents prefix bypass like music-evil).
+function isPathInsideDir(child, parent) {
+  try {
+    const rel = path.relative(path.resolve(parent), path.resolve(child));
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  } catch {
+    return false;
+  }
+}
+
+function safeJoinDownloadDir(downloadDir, fileName) {
+  if (typeof fileName !== 'string' || fileName.includes('\0')) return null;
+  // Reject absolute paths and traversal attempts early
+  if (path.isAbsolute(fileName)) return null;
+  const joined = path.normalize(path.join(downloadDir, fileName));
+  if (!isPathInsideDir(joined, downloadDir) && path.resolve(joined) !== path.resolve(downloadDir)) return null;
+  // Extra guard: fileName itself must not contain directory separators after sanitization
+  const base = path.basename(joined);
+  if (base !== path.basename(fileName) && fileName.includes('..')) return null;
+  return joined;
+}
+
+function validateTranscodings(transcodings) {
+  if (!Array.isArray(transcodings) || transcodings.length === 0 || transcodings.length > 10) return false;
+  for (const t of transcodings) {
+    if (!t || typeof t !== 'object') return false;
+    if (!t.url || typeof t.url !== 'string' || !validateUrl(t.url)) return false;
+    const proto = t?.format?.protocol;
+    if (proto !== 'progressive' && proto !== 'hls') return false;
+  }
+  return true;
+}
+
+function sanitizeTrackMeta(input) {
+  if (!input || typeof input !== 'object') return null;
+  const trackId = String(input.trackId ?? input.id ?? '');
+  if (!isValidTrackId(trackId)) return null;
+  const title = typeof input.title === 'string' ? input.title.trim().slice(0, 300) : '';
+  const artist = typeof input.artist === 'string' ? input.artist.trim().slice(0, 300) : '';
+  if (!title || !artist) return null;
+  const artworkUrl = input.artworkUrl ?? input.artwork_url ?? '';
+  if (artworkUrl && (typeof artworkUrl !== 'string' || artworkUrl.length > 2048 || !validateUrl(artworkUrl))) return null;
+  if (!validateTranscodings(input.transcodings)) return null;
+  const duration = Number(input.duration || 0);
+  if (!Number.isFinite(duration) || duration < 0 || duration > 10 * 3600 * 1000) return null;
+  return { trackId, title, artist, artworkUrl: artworkUrl || '', transcodings: input.transcodings, duration };
+}
+
+function isSafeDownloadDir(dir) {
+  try {
+    if (typeof dir !== 'string' || !path.isAbsolute(dir)) return false;
+    const norm = path.normalize(dir);
+    if (norm.includes('\0')) return false;
+    // Block filesystem roots and OS-sensitive locations
+    const lower = process.platform === 'win32' ? norm.toLowerCase() : norm;
+    const blockedExact = process.platform === 'win32'
+      ? ['c:\\', 'c:/', 'c:', 'd:\\', 'd:/']
+      : ['/', '/root', '/etc', '/bin', '/sbin', '/usr', '/boot', '/sys', '/proc'];
+    if (blockedExact.includes(lower)) return false;
+    const blockedSub = process.platform === 'win32'
+      ? ['c:\\windows', 'c:\\program files', 'c:\\program files (x86)', 'c:\\system', 'c:/windows']
+      : ['/etc/', '/bin/', '/sbin/', '/usr/bin', '/boot/', '/sys/', '/proc/'];
+    if (blockedSub.some(p => process.platform === 'win32' ? lower.startsWith(p) : norm.startsWith(p))) return false;
+    return true;
+  } catch {
     return false;
   }
 }
@@ -96,31 +197,76 @@ function loadSettingsFromDB() {
   }
 
   settings.downloadDirectory = savedDir;
-  settings.volume = db.getSetting('volume', 0.8);
-  settings.repeatMode = db.getSetting('repeatMode', 'none');
-  settings.shuffleMode = db.getSetting('shuffleMode', false);
-  settings.windowWidth = db.getSetting('windowWidth', 1100);
-  settings.windowHeight = db.getSetting('windowHeight', 750);
+  const vol = db.getSetting('volume', 0.8);
+  settings.volume = (typeof vol === 'number' && vol >= 0 && vol <= 1) ? vol : 0.8;
+  const rm = db.getSetting('repeatMode', 'none');
+  settings.repeatMode = ['none', 'one', 'all'].includes(rm) ? rm : 'none';
+  settings.shuffleMode = !!db.getSetting('shuffleMode', false);
+  const ww = db.getSetting('windowWidth', 1100);
+  const wh = db.getSetting('windowHeight', 750);
+  settings.windowWidth = (Number.isInteger(ww) && ww >= 600 && ww <= 3840) ? ww : 1100;
+  settings.windowHeight = (Number.isInteger(wh) && wh >= 400 && wh <= 2160) ? wh : 750;
+  // SECURITY FIX: validate persisted download dir on load; reset to default if unsafe
+  if (!isSafeDownloadDir(settings.downloadDirectory)) {
+    settings.downloadDirectory = defaultDir;
+    try { db.setSetting('downloadDirectory', defaultDir); } catch (_) {}
+  }
 }
 
 function saveSettingToDB(key, value) {
   db.setSetting(key, value);
 }
 
+// SECURITY FIX: allowlist for renderer-controlled settings.
+// downloadDirectory may only be changed via select-download-dir dialog.
+const SETTINGS_ALLOWLIST = new Set(['volume', 'repeatMode', 'shuffleMode', 'windowWidth', 'windowHeight']);
+function sanitizeSettingsPatch(patch) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return {};
+  const out = {};
+  if ('volume' in patch) {
+    const v = Number(patch.volume);
+    if (Number.isFinite(v) && v >= 0 && v <= 1) out.volume = v;
+  }
+  if ('repeatMode' in patch) {
+    if (['none', 'one', 'all'].includes(patch.repeatMode)) out.repeatMode = patch.repeatMode;
+  }
+  if ('shuffleMode' in patch) {
+    if (typeof patch.shuffleMode === 'boolean') out.shuffleMode = patch.shuffleMode;
+  }
+  if ('windowWidth' in patch) {
+    const w = Number(patch.windowWidth);
+    if (Number.isInteger(w) && w >= 600 && w <= 3840) out.windowWidth = w;
+  }
+  if ('windowHeight' in patch) {
+    const h = Number(patch.windowHeight);
+    if (Number.isInteger(h) && h >= 400 && h <= 2160) out.windowHeight = h;
+  }
+  return out;
+}
+
 // ----------------------------------------------------
 // Secure Token Management (using safeStorage)
 // ----------------------------------------------------
+// In-memory fallback when OS keychain is unavailable — never persist plaintext.
+let inMemoryToken = null;
 function saveOauthToken(token) {
-  if (!token) return;
+  if (!token || typeof token !== 'string') return;
+  const clean = token.trim();
+  if (!isValidTokenFormat(clean)) {
+    console.warn('Refused to store token with invalid format.');
+    return;
+  }
   try {
     if (safeStorage.isEncryptionAvailable()) {
-      const encrypted = safeStorage.encryptString(token);
+      const encrypted = safeStorage.encryptString(clean);
       db.saveToken('oauth_token', encrypted);
+      inMemoryToken = null;
       console.log('oauth_token encrypted and stored securely.');
     } else {
-      // Fallback if safeStorage is not available (dev fallback, though it usually is on Win/Mac)
-      db.saveToken('oauth_token', Buffer.from(token, 'utf8'));
-      console.warn('safeStorage not available. Token saved as plain text buffer.');
+      // SECURITY FIX: do not write plaintext to disk. Keep only in memory.
+      inMemoryToken = clean;
+      try { db.deleteToken('oauth_token'); } catch (_) {}
+      console.warn('safeStorage not available. Token kept in memory only (not persisted).');
     }
   } catch (e) {
     console.error('Failed to encrypt/save token:', e);
@@ -130,23 +276,31 @@ function saveOauthToken(token) {
 function getOauthToken() {
   try {
     const buffer = db.getToken('oauth_token');
-    if (!buffer) return null;
-
-    if (safeStorage.isEncryptionAvailable()) {
-      return safeStorage.decryptString(buffer);
-    } else {
-      return buffer.toString('utf8');
+    if (buffer) {
+      if (safeStorage.isEncryptionAvailable()) {
+        const dec = safeStorage.decryptString(buffer);
+        return isValidTokenFormat(dec) ? dec : null;
+      } else {
+        // Plaintext on disk from old versions: migrate to memory and wipe.
+        const plain = buffer.toString('utf8');
+        if (isValidTokenFormat(plain)) inMemoryToken = plain.trim();
+        try { db.deleteToken('oauth_token'); } catch (_) {}
+        return inMemoryToken;
+      }
     }
+    return inMemoryToken;
   } catch (e) {
     console.error('Failed to decrypt token:', e);
-    return null;
+    return inMemoryToken || null;
   }
 }
 
 // Fetch user profile via SoundCloud API /me
 async function fetchUserProfile(token) {
   try {
+    if (!isValidTokenFormat(token)) return null;
     const clientId = await getClientId();
+    if (!isValidClientId(clientId)) throw new Error('Invalid client_id.');
     const url = `https://api-v2.soundcloud.com/me?client_id=${clientId}`;
     
     // Strict URL check
@@ -154,10 +308,11 @@ async function fetchUserProfile(token) {
 
     const res = await axios.get(url, {
       headers: {
-        'Authorization': `OAuth ${token}`,
+        'Authorization': `OAuth ${token.trim()}`,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
       },
-      timeout: 8000
+      timeout: 8000,
+      maxContentLength: 2 * 1024 * 1024
     });
     return res.data;
   } catch (e) {
@@ -175,23 +330,28 @@ const searchCache = new Map();
 const SEARCH_CACHE_TTL = 5 * 60 * 1000;
 
 async function getClientId() {
-  if (activeClientId) return activeClientId;
+  if (activeClientId && isValidClientId(activeClientId)) return activeClientId;
+  activeClientId = null;
 
   // Try loading from cache
   let cached = null;
   try {
-    if (fs.existsSync(cachePath)) {
-      cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    if (cachePath && fs.existsSync(cachePath)) {
+      const raw = fs.readFileSync(cachePath, 'utf8');
+      if (raw.length > 1024) throw new Error('client-id cache too large');
+      cached = JSON.parse(raw);
+      if (!cached || !isValidClientId(cached.clientId)) throw new Error('invalid cached client_id format');
+      if (typeof cached.validatedAt !== 'number') throw new Error('invalid cache timestamp');
       const oneDay = 24 * 60 * 60 * 1000;
-      if (cached.clientId && cached.validatedAt && (Date.now() - cached.validatedAt < 3 * oneDay)) {
+      if (cached.validatedAt && (Date.now() - cached.validatedAt < 3 * oneDay)) {
         // Cache is young, trust it without validating to make first search/action instant
-        console.log('Using cached client_id without validation:', cached.clientId);
+        console.log('Using cached client_id without validation.');
         activeClientId = cached.clientId;
         return activeClientId;
-      } else if (cached.clientId && cached.validatedAt && (Date.now() - cached.validatedAt < 7 * oneDay)) {
+      } else if (cached.validatedAt && (Date.now() - cached.validatedAt < 7 * oneDay)) {
         const isValid = await validateClientId(cached.clientId);
         if (isValid) {
-          console.log('Using cached client_id:', cached.clientId);
+          console.log('Using cached client_id.');
           activeClientId = cached.clientId;
           return activeClientId;
         }
@@ -204,13 +364,15 @@ async function getClientId() {
   // Scrape a new client ID
   console.log('Scraping new client_id...');
   const newId = await scrapeClientId();
-  if (newId) {
+  if (newId && isValidClientId(newId)) {
     activeClientId = newId;
     try {
-      fs.writeFileSync(cachePath, JSON.stringify({
-        clientId: newId,
-        validatedAt: Date.now()
-      }, null, 2), 'utf8');
+      if (cachePath) {
+        fs.writeFileSync(cachePath, JSON.stringify({
+          clientId: newId,
+          validatedAt: Date.now()
+        }, null, 2), { encoding: 'utf8', mode: 0o600 });
+      }
     } catch (e) {
       console.error('Failed to save client_id cache:', e);
     }
@@ -218,16 +380,17 @@ async function getClientId() {
   }
 
   const fallback = 'iZ6gthvODSYgDRB5wo1cm51LSbs0uqO2';
-  console.log('Scraping failed, using fallback client_id:', fallback);
+  console.log('Scraping failed, using fallback client_id.');
   activeClientId = fallback;
   return fallback;
 }
 
 async function validateClientId(id) {
   try {
+    if (!isValidClientId(id)) return false;
     const url = `https://api-v2.soundcloud.com/search/tracks?q=chill&client_id=${id}&limit=1`;
     if (!validateUrl(url)) return false;
-    const res = await axios.get(url, { timeout: 5000 });
+    const res = await axios.get(url, { timeout: 5000, maxContentLength: 2 * 1024 * 1024 });
     return res.status === 200;
   } catch (e) {
     return false;
@@ -236,30 +399,34 @@ async function validateClientId(id) {
 
 async function scrapeClientId() {
   try {
+    if (!validateUrl('https://soundcloud.com/')) return null;
     const res = await axios.get('https://soundcloud.com', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       },
-      timeout: 10000
+      timeout: 10000,
+      maxContentLength: 5 * 1024 * 1024
     });
-    const html = res.data;
+    const html = typeof res.data === 'string' ? res.data : '';
+    if (html.length > 5 * 1024 * 1024) return null;
 
     const scriptRegex = /<script[^>]+src=["'](https:\/\/a-v2\.sndcdn\.com\/assets\/[^"']+\.js)["']/g;
     let match;
     const scriptUrls = [];
     while ((match = scriptRegex.exec(html)) !== null) {
       scriptUrls.push(match[1]);
+      if (scriptUrls.length > 20) break;
     }
     scriptUrls.reverse();
 
     for (const url of scriptUrls) {
       try {
         if (!validateUrl(url)) continue; // Whitelist check on scripts
-        const jsRes = await axios.get(url, { timeout: 5000 });
-        const js = jsRes.data;
+        const jsRes = await axios.get(url, { timeout: 5000, maxContentLength: 5 * 1024 * 1024, responseType: 'text' });
+        const js = typeof jsRes.data === 'string' ? jsRes.data : '';
         const idMatch = js.match(/client_id\s*:\s*["']([a-zA-Z0-9]{32})["']/);
-        if (idMatch && idMatch[1]) {
-          console.log(`Found client_id: ${idMatch[1]}`);
+        if (idMatch && idMatch[1] && isValidClientId(idMatch[1])) {
+          console.log('Found client_id.');
           return idMatch[1];
         }
       } catch (err) {}
@@ -282,23 +449,31 @@ function registerMediaProtocol() {
       }
 
       const rawPath = request.url.slice('media://path/'.length);
-      const decodedPath = decodeURIComponent(rawPath);
+      if (rawPath.includes('\0') || rawPath.length > 4096) {
+        return new Response('Access Denied', { status: 403 });
+      }
+      let decodedPath;
+      try {
+        decodedPath = decodeURIComponent(rawPath);
+      } catch {
+        return new Response('Access Denied', { status: 403 });
+      }
+      // SECURITY FIX: reject double-encoding / null bytes / traversal tricks
+      if (decodedPath.includes('\0') || decodedPath.includes('%')) {
+        // Allow literal % in filenames but block encoded traversal after decode
+        if (/%2e|%2f|%5c/i.test(rawPath) && /(\.\.[/\\])/.test(decodedPath)) {
+          return new Response('Access Denied', { status: 403 });
+        }
+      }
       
       const filePath = process.platform === 'win32' && decodedPath.startsWith('/')
         ? decodedPath.slice(1)
         : decodedPath;
 
-      // Prevent loading files outside of allowed scopes (like windows system directories)
-      // Limit access to settings.downloadDirectory or standard music folders
+      // SECURITY FIX: use path.relative to prevent prefix bypass (e.g. music-evil).
       const normalizedFile = path.normalize(filePath);
-      const normalizedDownloadDir = path.normalize(settings.downloadDirectory);
-      
-      const isAllowed = process.platform === 'win32'
-        ? normalizedFile.toLowerCase().startsWith(normalizedDownloadDir.toLowerCase())
-        : normalizedFile.startsWith(normalizedDownloadDir);
-
-      if (!isAllowed) {
-        console.warn(`Blocked unauthorized local file access: ${normalizedFile}`);
+      if (!isPathInsideDir(normalizedFile, settings.downloadDirectory)) {
+        console.warn('Blocked unauthorized local file access.');
         return new Response('Access Denied', { status: 403 });
       }
 
@@ -317,9 +492,11 @@ function registerMediaProtocol() {
 // Crash Recovery: Clean Isolated Temp Folder
 // ----------------------------------------------------
 function cleanTempDirectory() {
+  if (!isSafeDownloadDir(settings.downloadDirectory)) return;
   const tempDir = path.join(settings.downloadDirectory, '.temp');
   try {
     if (fs.existsSync(tempDir)) {
+      if (!isPathInsideDir(tempDir, settings.downloadDirectory)) return;
       console.log('Cleaning up isolated temporary downloads directory on startup...');
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -331,10 +508,17 @@ function cleanTempDirectory() {
 
 // Helper to sanitize file names (strictly blocks path traversal and injection chars)
 function sanitizeFilename(name) {
-  // Strip forbidden filesystem characters (not dots — dots are valid in filenames)
-  const safe = name.replace(/[\\/:*?"<>|]/g, '_').trim();
-  // Limit to 180 chars to stay well within Windows MAX_PATH limits
-  return safe.slice(0, 180);
+  if (typeof name !== 'string') return 'untitled';
+  // Remove control chars and strip forbidden filesystem characters
+  let safe = name.replace(/[\x00-\x1F\x7F]/g, '').replace(/[\\/:*?"<>|]/g, '_').trim();
+  // Strip trailing dots/spaces (Windows) and leading dots (hidden files)
+  safe = safe.replace(/[. ]+$/g, '').replace(/^\.+/g, '_');
+  if (!safe) return 'untitled';
+  // Block Windows reserved device names
+  const base = safe.split('.')[0];
+  if (WINDOWS_RESERVED_RE.test(base)) safe = '_' + safe;
+  // Limit to 100 chars to stay well within Windows MAX_PATH limits (artist + title + ext)
+  return safe.slice(0, 100) || 'untitled';
 }
 
 // ----------------------------------------------------
@@ -358,7 +542,14 @@ function checkQueue() {
 }
 
 async function processDownload(item) {
-  const { trackId, title, artist, artworkUrl, transcodings } = item;
+  // SECURITY FIX: validate all renderer-supplied fields; reject path traversal via trackId.
+  const meta = sanitizeTrackMeta(item);
+  if (!meta) {
+    console.warn('Rejected download with invalid metadata.');
+    return;
+  }
+  const { trackId, title, artist, artworkUrl, transcodings } = meta;
+  const durationSafe = meta.duration;
 
   // Create an AbortController for this download
   const abortController = new AbortController();
@@ -369,12 +560,25 @@ async function processDownload(item) {
   const safeTitle = sanitizeFilename(title);
   const baseName = `${safeArtist} - ${safeTitle}`;
   const outDir = settings.downloadDirectory;
+  if (!isSafeDownloadDir(outDir)) {
+    console.error('Unsafe download directory, aborting download.');
+    activeDownloadControllers.delete(trackId);
+    activeDownloadsCount--;
+    return;
+  }
   const tempDir = path.join(outDir, '.temp');
   
-  const mp3Path = path.join(outDir, `${baseName}.mp3`);
-  const jpgPath = path.join(outDir, `${baseName}.jpg`);
+  const mp3Path = safeJoinDownloadDir(outDir, `${baseName}.mp3`);
+  const jpgPath = safeJoinDownloadDir(outDir, `${baseName}.jpg`);
   const tmpMp3Path = path.join(tempDir, `${trackId}.tmp.mp3`);
   const tmpJpgPath = path.join(tempDir, `${trackId}.tmp.jpg`);
+  // SECURITY FIX: tmp paths must stay inside tempDir (trackId is numeric, but double-check)
+  if (!mp3Path || !jpgPath || !isPathInsideDir(tmpMp3Path, tempDir) || !isPathInsideDir(tmpJpgPath, tempDir)) {
+    console.warn('Blocked download path escape attempt.');
+    activeDownloadControllers.delete(trackId);
+    activeDownloadsCount--;
+    return;
+  }
 
   const updateStatus = (status, progress = 0, error = null) => {
     db.saveDownloadTask({
@@ -407,23 +611,35 @@ async function processDownload(item) {
       fs.mkdirSync(tempDir, { recursive: true });
     }
 
-    // Step 1: Download Cover Art
+    // Step 1: Download Cover Art (capped to prevent OOM/disk abuse)
     updateStatus('downloading', 5);
     let coverBuffer = null;
     if (artworkUrl) {
       try {
         if (!validateUrl(artworkUrl)) throw new Error('Cover art URL not whitelisted.');
-        const coverRes = await axios.get(artworkUrl, { responseType: 'arraybuffer', timeout: 8000 });
+        const coverRes = await axios.get(artworkUrl, {
+          responseType: 'arraybuffer',
+          timeout: 8000,
+          maxContentLength: 10 * 1024 * 1024,
+          maxBodyLength: 10 * 1024 * 1024
+        });
+        const ct = (coverRes.headers?.['content-type'] || '').toLowerCase();
+        if (ct && !ct.startsWith('image/') && !ct.startsWith('application/octet-stream')) {
+          throw new Error('Unexpected cover content-type.');
+        }
         coverBuffer = Buffer.from(coverRes.data);
+        if (coverBuffer.length > 10 * 1024 * 1024) throw new Error('Cover art too large.');
         fs.writeFileSync(tmpJpgPath, coverBuffer);
       } catch (err) {
         console.warn('Failed to download cover art:', err.message);
+        coverBuffer = null;
       }
     }
 
     // Step 2: Resolve stream URL
     updateStatus('downloading', 15);
     const clientId = await getClientId();
+    if (!isValidClientId(clientId)) throw new Error('Invalid client_id.');
     
     // Choose progressive MP3 transcoding if available, otherwise HLS
     let selectedTranscoding = transcodings.find(t => t.format.protocol === 'progressive');
@@ -441,10 +657,10 @@ async function processDownload(item) {
     const streamMetaUrl = `${selectedTranscoding.url}?client_id=${clientId}`;
     if (!validateUrl(streamMetaUrl)) throw new Error('Resolved stream metadata URL not whitelisted.');
 
-    const streamMetaRes = await axios.get(streamMetaUrl);
-    const directStreamUrl = streamMetaRes.data.url;
+    const streamMetaRes = await axios.get(streamMetaUrl, { timeout: 10000, maxContentLength: 2 * 1024 * 1024 });
+    const directStreamUrl = streamMetaRes.data?.url;
 
-    if (!directStreamUrl || !validateUrl(directStreamUrl)) {
+    if (typeof directStreamUrl !== 'string' || !validateUrl(directStreamUrl)) {
       throw new Error('Could not resolve secure streaming CDN URL.');
     }
 
@@ -453,11 +669,14 @@ async function processDownload(item) {
 
     if (isHls) {
       // HLS download using ffmpeg (spawned directly, protecting against shell injections)
+      // SECURITY FIX: restrict protocols to prevent SSRF via m3u8 segments (no file://).
       await new Promise((resolve, reject) => {
         const cmd = ffmpeg(directStreamUrl)
           .inputOptions([
             '-http_persistent 1',
-            '-threads 4'
+            '-threads 4',
+            '-rw_timeout 15000000',
+            '-protocol_whitelist http,https,tcp,tls,crypto'
           ])
           .outputOptions('-c copy')
           .format('mp3')
@@ -485,22 +704,42 @@ async function processDownload(item) {
           try { cmd.kill('SIGKILL'); } catch (_) {}
           reject(new Error('CANCELLED'));
         });
+        // Watchdog: kill HLS after 10 minutes to avoid hung ffmpeg
+        setTimeout(() => {
+          try { cmd.kill('SIGKILL'); } catch (_) {}
+        }, 10 * 60 * 1000).unref?.();
       });
     } else {
-      // Progressive MP3 download via axios stream
+      // Progressive MP3 download via axios stream (capped at 250 MB)
+      const MAX_AUDIO_BYTES = 250 * 1024 * 1024;
       const writer = fs.createWriteStream(tmpMp3Path, { highWaterMark: 1024 * 1024 });
       const streamRes = await axios({
         url: directStreamUrl,
         method: 'GET',
         responseType: 'stream',
-        signal: abortController.signal
+        signal: abortController.signal,
+        timeout: 30000,
+        maxContentLength: MAX_AUDIO_BYTES,
+        maxBodyLength: MAX_AUDIO_BYTES
       });
 
       const totalLength = parseInt(streamRes.headers['content-length'] || '0', 10);
+      if (Number.isFinite(totalLength) && totalLength > MAX_AUDIO_BYTES) {
+        try { streamRes.data.destroy(); } catch (_) {}
+        try { writer.destroy(); } catch (_) {}
+        throw new Error('Audio file too large.');
+      }
       let downloadedLength = 0;
+      let abortedOversize = false;
 
       streamRes.data.on('data', (chunk) => {
         downloadedLength += chunk.length;
+        if (downloadedLength > MAX_AUDIO_BYTES && !abortedOversize) {
+          abortedOversize = true;
+          try { streamRes.data.destroy(new Error('Audio file too large.')); } catch (_) {}
+          try { writer.destroy(); } catch (_) {}
+          return;
+        }
         if (totalLength > 0) {
           const progress = Math.min(80, 25 + Math.round((downloadedLength / totalLength) * 55));
           updateStatus('downloading', progress);
@@ -510,18 +749,19 @@ async function processDownload(item) {
       streamRes.data.pipe(writer);
 
       await new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
+        writer.on('finish', () => abortedOversize ? reject(new Error('Audio file too large.')) : resolve());
         writer.on('error', (err) => {
           writer.destroy();
           reject(err);
         });
+        streamRes.data.on('error', reject);
       });
     }
 
     // Check if cancelled between steps
     if (abortController.signal.aborted) throw new Error('CANCELLED');
 
-    // Step 4: File Integrity Verification (Size must be > 100KB)
+    // Step 4: File Integrity Verification (Size must be 100KB..250MB)
     if (!fs.existsSync(tmpMp3Path)) {
       throw new Error('Downloaded temporary file not found on disk.');
     }
@@ -529,12 +769,16 @@ async function processDownload(item) {
     if (fileSize < 100 * 1024) {
       throw new Error(`File integrity check failed: downloaded file size (${Math.round(fileSize/1024)} KB) is too small.`);
     }
+    if (fileSize > 250 * 1024 * 1024) {
+      throw new Error('File integrity check failed: file too large.');
+    }
 
     // Step 5: Tag Metadata (Title, Artist, Album, Cover Art)
     updateStatus('tagging', 85);
+    // SECURITY FIX: truncate ID3 fields to prevent tag-overflow / injection.
     const tags = {
-      title: title,
-      artist: artist,
+      title: String(title).slice(0, 300),
+      artist: String(artist).slice(0, 300),
       album: 'SoundCloud',
     };
 
@@ -582,11 +826,11 @@ async function processDownload(item) {
     // Save success record to tracks database
     db.addTrack({
       id: trackId,
-      title,
-      artist,
+      title: String(title).slice(0, 300),
+      artist: String(artist).slice(0, 300),
       fileName: `${baseName}.mp3`,
       coverName: coverBuffer ? `${baseName}.jpg` : null,
-      duration: item.duration || 0,
+      duration: durationSafe || 0,
       downloadedAt: Date.now()
     });
 
@@ -641,9 +885,20 @@ function createWindow() {
       webSecurity: true, // Secure Same-Origin Policy
       contextIsolation: true, // Froze bridge isolation
       nodeIntegration: false, // Prevent direct shell exploits
-      sandbox: true // Run renderer inside isolated sandbox
+      sandbox: true, // Run renderer inside isolated sandbox
+      webviewTag: false,
+      allowRunningInsecureContent: false,
+      experimentalFeatures: false
     }
   });
+
+  // SECURITY FIX: deny all permission requests (mic/camera/geolocation/etc.)
+  try {
+    const ses = mainWindow.webContents.session;
+    ses.setPermissionRequestHandler((webContents, permission, callback) => callback(false));
+    // Block attachment of webviews
+    mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
+  } catch (_) {}
 
   mainWindow.setMenuBarVisibility(false);
 
@@ -721,8 +976,10 @@ ipcMain.handle('get-settings', () => {
 });
 
 ipcMain.handle('save-settings', (event, newSettings) => {
-  settings = { ...settings, ...newSettings };
-  for (const [key, val] of Object.entries(newSettings)) {
+  // SECURITY FIX: allowlist + range validation; downloadDirectory cannot be set here.
+  const clean = sanitizeSettingsPatch(newSettings);
+  settings = { ...settings, ...clean };
+  for (const [key, val] of Object.entries(clean)) {
     saveSettingToDB(key, val);
   }
   return settings;
@@ -736,34 +993,55 @@ ipcMain.handle('select-download-dir', async () => {
   });
   if (!result.canceled && result.filePaths.length > 0) {
     const newDir = result.filePaths[0];
-    settings.downloadDirectory = newDir;
-    saveSettingToDB('downloadDirectory', newDir);
+    // SECURITY FIX: validate dialog result before accepting.
+    if (!isSafeDownloadDir(newDir)) {
+      console.warn('Rejected unsafe download directory selection.');
+      return null;
+    }
+    try {
+      fs.mkdirSync(path.join(newDir, '.temp'), { recursive: true });
+    } catch (e) {
+      console.error('Download dir not writable:', e.message);
+      return null;
+    }
+    settings.downloadDirectory = path.normalize(newDir);
+    saveSettingToDB('downloadDirectory', settings.downloadDirectory);
     cleanTempDirectory(); // setup temp folder inside the new path
-    return newDir;
+    return settings.downloadDirectory;
   }
   return null;
 });
 
 // Open URL in system browser
 ipcMain.handle('open-external', (event, url) => {
-  const allowed = ['https://github.com/qveqa'];
-  if (allowed.some(u => url.startsWith(u))) {
-    shell.openExternal(url);
-  }
+  // SECURITY FIX: strict URL parsing instead of startsWith (prevents github.com/qveqa.evil bypass).
+  try {
+    if (typeof url !== 'string' || url.length > 512) return;
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return;
+    if (parsed.hostname.toLowerCase() !== 'github.com') return;
+    const p = parsed.pathname;
+    if (!(p === '/qveqa' || p.startsWith('/qveqa/'))) return;
+    shell.openExternal(parsed.toString());
+  } catch (_) {}
 });
 
 // Search playlists
 ipcMain.handle('search-playlists', async (event, query) => {
   try {
+    if (typeof query !== 'string') throw new Error('Invalid query.');
+    const q = query.trim().slice(0, 200);
+    if (!q) throw new Error('Empty query.');
     const clientId = await getClientId();
-    const url = `https://api-v2.soundcloud.com/search/playlists?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=16`;
+    if (!isValidClientId(clientId)) throw new Error('Invalid client_id.');
+    const url = `https://api-v2.soundcloud.com/search/playlists?q=${encodeURIComponent(q)}&client_id=${clientId}&limit=16`;
     if (!validateUrl(url)) throw new Error('Playlist search URL not allowed.');
 
     const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' };
     const token = getOauthToken();
     if (token) headers['Authorization'] = `OAuth ${token}`;
 
-    const res = await axios.get(url, { headers, timeout: 10000 });
+    const res = await axios.get(url, { headers, timeout: 10000, maxContentLength: 5 * 1024 * 1024 });
     return res.data;
   } catch (err) {
     console.error('Playlist search failed:', err.message);
@@ -775,23 +1053,24 @@ ipcMain.handle('search-playlists', async (event, query) => {
 ipcMain.handle('get-playlist', async (event, playlistId) => {
   try {
     // Validate playlistId is numeric
-    if (!/^\d+$/.test(String(playlistId))) throw new Error('Invalid playlist ID.');
+    if (!/^\d{1,20}$/.test(String(playlistId))) throw new Error('Invalid playlist ID.');
 
     const clientId = await getClientId();
-    const url = `https://api-v2.soundcloud.com/playlists/${playlistId}?client_id=${clientId}`;
+    if (!isValidClientId(clientId)) throw new Error('Invalid client_id.');
+    const url = `https://api-v2.soundcloud.com/playlists/${encodeURIComponent(String(playlistId))}?client_id=${clientId}`;
     if (!validateUrl(url)) throw new Error('Playlist URL not allowed.');
 
     const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' };
     const token = getOauthToken();
     if (token) headers['Authorization'] = `OAuth ${token}`;
 
-    const res = await axios.get(url, { headers, timeout: 15000 });
+    const res = await axios.get(url, { headers, timeout: 15000, maxContentLength: 10 * 1024 * 1024 });
     return res.data;
   } catch (err) {
     console.error('Get playlist failed:', err.message);
     if (err.response?.status === 401 || err.response?.status === 403) {
       activeClientId = null;
-      try { fs.unlinkSync(cachePath); } catch (_) {}
+      try { if (cachePath) fs.unlinkSync(cachePath); } catch (_) {}
     }
     throw new Error(err.response?.data?.message || err.message);
   }
@@ -806,24 +1085,26 @@ ipcMain.handle('get-playlist', async (event, playlistId) => {
 function buildPlayableUserTrack(t) {
   let filePath = null;
   let coverPath = null;
+  if (!t || !isValidTrackId(t.trackId)) return null;
   const downloaded = db.getTrackById(String(t.trackId));
   if (downloaded) {
-    const fp = path.join(settings.downloadDirectory, downloaded.fileName);
-    if (fs.existsSync(fp)) {
+    const fp = safeJoinDownloadDir(settings.downloadDirectory, downloaded.fileName);
+    if (fp && fs.existsSync(fp)) {
       filePath = fp;
-      coverPath = downloaded.coverName
-        ? path.join(settings.downloadDirectory, downloaded.coverName)
-        : null;
+      if (downloaded.coverName) {
+        const cp = safeJoinDownloadDir(settings.downloadDirectory, downloaded.coverName);
+        if (cp && fs.existsSync(cp)) coverPath = cp;
+      }
     }
   }
   return {
     id: String(t.trackId),
     trackId: String(t.trackId),
-    title: t.title,
-    artist: t.artist,
-    duration: t.duration,
-    artwork_url: t.artworkUrl || null,
-    media: { transcodings: t.transcodings || [] },
+    title: String(t.title || '').slice(0, 300),
+    artist: String(t.artist || '').slice(0, 300),
+    duration: Number(t.duration) || 0,
+    artwork_url: (typeof t.artworkUrl === 'string' && validateUrl(t.artworkUrl)) ? t.artworkUrl : null,
+    media: { transcodings: Array.isArray(t.transcodings) ? t.transcodings.filter(x => x && typeof x.url === 'string' && validateUrl(x.url)).slice(0, 10) : [] },
     filePath,
     coverPath
   };
@@ -837,58 +1118,77 @@ ipcMain.handle('get-user-playlists', () => {
     if (!p.cover_url && p.first_track_id) {
       const dl = db.getTrackById(String(p.first_track_id));
       if (dl && dl.coverName) {
-        const cp = path.join(settings.downloadDirectory, dl.coverName);
-        if (fs.existsSync(cp)) coverPath = cp;
+        const cp = safeJoinDownloadDir(settings.downloadDirectory, dl.coverName);
+        if (cp && fs.existsSync(cp)) coverPath = cp;
       }
     }
     return {
       id: p.id,
-      name: p.name,
+      name: String(p.name || '').slice(0, 120),
       created_at: p.created_at,
       track_count: p.track_count,
-      cover_url: p.cover_url || null,
+      cover_url: (typeof p.cover_url === 'string' && validateUrl(p.cover_url)) ? p.cover_url : null,
       coverPath
     };
   });
 });
 
 ipcMain.handle('create-playlist', (event, name) => {
-  if (!name || !String(name).trim()) return null;
-  return db.createPlaylist(name);
+  if (!name || typeof name !== 'string' || !name.trim() || name.trim().length > 120) return null;
+  return db.createPlaylist(name.trim());
 });
 
 ipcMain.handle('rename-playlist', (event, { id, name }) => {
-  if (!name || !String(name).trim()) return false;
-  return db.renamePlaylist(id, name);
+  if (!Number.isInteger(id) && !/^\d+$/.test(String(id))) return false;
+  if (!name || typeof name !== 'string' || !name.trim() || name.trim().length > 120) return false;
+  return db.renamePlaylist(Number(id) || id, name.trim());
 });
 
 ipcMain.handle('delete-playlist', (event, id) => {
-  return db.deletePlaylist(id);
+  if (!Number.isInteger(id) && !/^\d+$/.test(String(id))) return false;
+  return db.deletePlaylist(Number(id) || id);
 });
 
 ipcMain.handle('add-track-to-playlist', (event, { playlistId, track }) => {
-  if (!playlistId || !track || !track.trackId) return { ok: false, added: false };
-  const added = db.addTrackToPlaylist(playlistId, track);
+  if ((!Number.isInteger(playlistId) && !/^\d+$/.test(String(playlistId)))) return { ok: false, added: false };
+  const clean = sanitizeTrackMeta(track);
+  if (!clean) return { ok: false, added: false };
+  const normalized = {
+    trackId: clean.trackId,
+    title: clean.title,
+    artist: clean.artist,
+    artworkUrl: clean.artworkUrl,
+    transcodings: clean.transcodings,
+    duration: clean.duration
+  };
+  const added = db.addTrackToPlaylist(Number(playlistId) || playlistId, normalized);
   return { ok: true, added };
 });
 
 ipcMain.handle('remove-track-from-playlist', (event, { playlistId, trackId }) => {
-  return db.removeTrackFromPlaylist(playlistId, trackId);
+  if ((!Number.isInteger(playlistId) && !/^\d+$/.test(String(playlistId)))) return false;
+  if (!isValidTrackId(trackId)) return false;
+  return db.removeTrackFromPlaylist(Number(playlistId) || playlistId, String(trackId));
 });
 
 ipcMain.handle('get-user-playlist-tracks', (event, playlistId) => {
-  const meta = db.getUserPlaylistById(playlistId);
-  const tracks = db.getUserPlaylistTracks(playlistId).map(buildPlayableUserTrack);
+  if ((!Number.isInteger(playlistId) && !/^\d+$/.test(String(playlistId)))) return { meta: null, tracks: [] };
+  const meta = db.getUserPlaylistById(Number(playlistId) || playlistId);
+  const tracks = db.getUserPlaylistTracks(Number(playlistId) || playlistId).map(buildPlayableUserTrack).filter(Boolean);
   return { meta, tracks };
 });
 
 // Proxied Searching
+// Proxied Searching
 ipcMain.handle('search-tracks', async (event, query) => {
-  const cacheKey = (query || '').trim().toLowerCase();
-  if (cacheKey && searchCache.has(cacheKey)) {
+  if (typeof query !== 'string') throw new Error('Invalid query.');
+  const q = query.trim().slice(0, 200);
+  if (!q) throw new Error('Empty query.');
+  const cacheKey = q.toLowerCase();
+  if (searchCache.has(cacheKey)) {
     const cached = searchCache.get(cacheKey);
     if (Date.now() - cached.timestamp < SEARCH_CACHE_TTL) {
-      console.log(`[Cache Hit] Returning search results for query: "${query}"`);
+      console.log('[Cache Hit] Returning search results.');
       return cached.data;
     }
     searchCache.delete(cacheKey);
@@ -896,7 +1196,8 @@ ipcMain.handle('search-tracks', async (event, query) => {
 
   try {
     const clientId = await getClientId();
-    const url = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=24`;
+    if (!isValidClientId(clientId)) throw new Error('Invalid client_id.');
+    const url = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${clientId}&limit=24`;
     
     if (!validateUrl(url)) throw new Error('Search URL hostname not allowed.');
 
@@ -910,7 +1211,7 @@ ipcMain.handle('search-tracks', async (event, query) => {
       headers['Authorization'] = `OAuth ${token}`;
     }
 
-    const res = await axios.get(url, { headers });
+    const res = await axios.get(url, { headers, timeout: 10000, maxContentLength: 5 * 1024 * 1024 });
 
     // Store in cache
     if (cacheKey) {
@@ -931,7 +1232,7 @@ ipcMain.handle('search-tracks', async (event, query) => {
     if (err.response?.status === 401 || err.response?.status === 403) {
       console.warn('Unauthorized/Forbidden search error detected. Resetting client ID cache...');
       activeClientId = null;
-      try { fs.unlinkSync(cachePath); } catch (_) {}
+      try { if (cachePath) fs.unlinkSync(cachePath); } catch (_) {}
     }
     throw new Error(err.response?.data?.message || err.message);
   }
@@ -941,11 +1242,13 @@ ipcMain.handle('search-tracks', async (event, query) => {
 ipcMain.handle('get-track-stream', async (event, { trackId, transcodings }) => {
   try {
     const clientId = await getClientId();
+    if (!isValidClientId(clientId)) throw new Error('Invalid client_id.');
 
     // Check trackId is strictly numeric
-    if (!/^\d+$/.test(trackId)) {
+    if (!isValidTrackId(trackId)) {
       throw new Error('Invalid track ID format.');
     }
+    if (!validateTranscodings(transcodings)) throw new Error('Invalid transcodings.');
 
     // Prioritize progressive MP3 stream
     let selectedTranscoding = transcodings.find(t => t.format.protocol === 'progressive');
@@ -966,10 +1269,12 @@ ipcMain.handle('get-track-stream', async (event, { trackId, transcodings }) => {
       headers['Authorization'] = `OAuth ${token}`;
     }
 
-    const streamMetaRes = await axios.get(streamMetaUrl, { headers });
+    const streamMetaRes = await axios.get(streamMetaUrl, { headers, timeout: 10000, maxContentLength: 2 * 1024 * 1024 });
+    const retUrl = streamMetaRes.data?.url;
+    if (typeof retUrl !== 'string' || !validateUrl(retUrl)) throw new Error('Invalid stream URL from API.');
     
     return {
-      url: streamMetaRes.data.url,
+      url: retUrl,
       protocol: selectedTranscoding.format.protocol
     };
   } catch (err) {
@@ -977,7 +1282,7 @@ ipcMain.handle('get-track-stream', async (event, { trackId, transcodings }) => {
     if (err.response?.status === 401 || err.response?.status === 403) {
       console.warn('Unauthorized/Forbidden stream resolution error detected. Resetting client ID cache...');
       activeClientId = null;
-      try { fs.unlinkSync(cachePath); } catch (_) {}
+      try { if (cachePath) fs.unlinkSync(cachePath); } catch (_) {}
     }
     throw new Error(err.message);
   }
@@ -985,13 +1290,19 @@ ipcMain.handle('get-track-stream', async (event, { trackId, transcodings }) => {
 
 // Trigger Track Download
 ipcMain.on('download-track', (event, track) => {
+  // SECURITY FIX: validate payload; trackId numeric prevents tmp path traversal.
+  const clean = sanitizeTrackMeta(track);
+  if (!clean) {
+    console.warn('Rejected download-track with invalid payload.');
+    return;
+  }
   // Check if task is already registered
   const tasks = db.getDownloadTasks();
-  const existingTask = tasks.find(t => t.trackId === track.trackId);
+  const existingTask = tasks.find(t => t.trackId === clean.trackId);
   
   if (existingTask) {
     if (existingTask.status === 'failed' || existingTask.status === 'completed') {
-      db.deleteDownloadTask(track.trackId);
+      db.deleteDownloadTask(clean.trackId);
     } else {
       return;
     }
@@ -999,17 +1310,17 @@ ipcMain.on('download-track', (event, track) => {
 
   // Save task to SQLite
   db.saveDownloadTask({
-    id: track.trackId,
-    title: track.title,
-    artist: track.artist,
-    artwork_url: track.artworkUrl,
-    transcodings: track.transcodings,
+    id: clean.trackId,
+    title: clean.title,
+    artist: clean.artist,
+    artwork_url: clean.artworkUrl,
+    transcodings: clean.transcodings,
     status: 'queued',
     progress: 0,
     created_at: Date.now()
   });
 
-  memoryQueue.push(track);
+  memoryQueue.push(clean);
   checkQueue();
 });
 
@@ -1017,39 +1328,42 @@ ipcMain.on('download-track', (event, track) => {
 ipcMain.handle('get-downloads', () => {
   const tracksList = db.getTracks();
   
-  // Validate that the files actually exist on the disk
+  // Validate that the files actually exist on the disk (with traversal-safe join)
   const validatedList = tracksList.filter(item => {
-    const filePath = path.join(settings.downloadDirectory, item.fileName);
-    return fs.existsSync(filePath);
+    const filePath = safeJoinDownloadDir(settings.downloadDirectory, item.fileName);
+    return filePath && fs.existsSync(filePath);
   });
 
   // Sync index if any files were deleted manually from explorer
   if (validatedList.length !== tracksList.length) {
     const ids = new Set(validatedList.map(t => t.id));
     tracksList.forEach(t => {
-      if (!ids.has(t.id)) db.deleteTrack(t.id);
+      if (!ids.has(t.id)) {
+        try { db.deleteTrack(t.id); } catch (_) {}
+      }
     });
   }
 
   return validatedList.map(item => ({
     ...item,
-    filePath: path.join(settings.downloadDirectory, item.fileName),
-    coverPath: item.coverName ? path.join(settings.downloadDirectory, item.coverName) : null
-  }));
+    filePath: safeJoinDownloadDir(settings.downloadDirectory, item.fileName),
+    coverPath: item.coverName ? safeJoinDownloadDir(settings.downloadDirectory, item.coverName) : null
+  })).filter(x => x.filePath);
 });
 
 // Delete Offline Download
 ipcMain.handle('delete-download', (event, trackId) => {
   try {
-    const item = db.getTrackById(trackId);
+    if (!isValidTrackId(trackId)) return false;
+    const item = db.getTrackById(String(trackId));
     if (item) {
-      const mp3Path = path.join(settings.downloadDirectory, item.fileName);
-      const jpgPath = item.coverName ? path.join(settings.downloadDirectory, item.coverName) : null;
+      const mp3Path = safeJoinDownloadDir(settings.downloadDirectory, item.fileName);
+      const jpgPath = item.coverName ? safeJoinDownloadDir(settings.downloadDirectory, item.coverName) : null;
       
-      if (fs.existsSync(mp3Path)) fs.unlinkSync(mp3Path);
+      if (mp3Path && fs.existsSync(mp3Path)) fs.unlinkSync(mp3Path);
       if (jpgPath && fs.existsSync(jpgPath)) fs.unlinkSync(jpgPath);
 
-      db.deleteTrack(trackId);
+      db.deleteTrack(String(trackId));
       return true;
     }
   } catch (e) {
@@ -1065,27 +1379,30 @@ ipcMain.handle('get-download-tasks', () => {
 
 // Delete task
 ipcMain.handle('delete-download-task', (event, trackId) => {
-  db.deleteDownloadTask(trackId);
+  if (!isValidTrackId(trackId)) return false;
+  db.deleteDownloadTask(String(trackId));
   return true;
 });
 
 // Cancel an active download
 ipcMain.handle('cancel-download-task', (event, trackId) => {
+  if (!isValidTrackId(trackId)) return false;
+  const tid = String(trackId);
   // Remove from memory queue if it's still waiting
-  const queueIdx = memoryQueue.findIndex(item => item.trackId === trackId);
+  const queueIdx = memoryQueue.findIndex(item => item.trackId === tid);
   if (queueIdx !== -1) {
     memoryQueue.splice(queueIdx, 1);
-    db.deleteDownloadTask(trackId);
+    db.deleteDownloadTask(tid);
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('download-progress', {
-        trackId, status: 'cancelled', progress: 0, error: 'Отменено пользователем', title: '', artist: ''
+        trackId: tid, status: 'cancelled', progress: 0, error: 'Отменено пользователем', title: '', artist: ''
       });
     }
     return true;
   }
 
   // Abort an in-progress download
-  const entry = activeDownloadControllers.get(trackId);
+  const entry = activeDownloadControllers.get(tid);
   if (entry) {
     entry.abortController.abort();
     if (entry.ffmpegCmd) {
@@ -1114,11 +1431,32 @@ ipcMain.handle('open-auth-window', async () => {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: true
+      sandbox: true,
+      webSecurity: true,
+      webviewTag: false,
+      allowRunningInsecureContent: false,
+      partition: 'persist:sc-auth'
     }
   });
 
   authWindow.setMenuBarVisibility(false);
+  // SECURITY FIX: isolate auth session, block navigation outside SoundCloud, deny popups/permissions.
+  try {
+    authWindow.webContents.session.setPermissionRequestHandler((wc, perm, cb) => cb(false));
+    authWindow.webContents.on('will-attach-webview', (e) => e.preventDefault());
+  } catch (_) {}
+  authWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  authWindow.webContents.on('will-navigate', (event, navUrl) => {
+    try {
+      const u = new URL(navUrl);
+      const h = u.hostname.toLowerCase();
+      if (!(h === 'soundcloud.com' || h.endsWith('.soundcloud.com'))) {
+        event.preventDefault();
+      }
+    } catch {
+      event.preventDefault();
+    }
+  });
   authWindow.loadURL('https://soundcloud.com/signin');
 
   let tokenCaptured = false;
@@ -1132,10 +1470,13 @@ ipcMain.handle('open-auth-window', async () => {
     if (tokenCaptured || authWindow.isDestroyed()) return;
     try {
       const cookies = await authWindow.webContents.session.cookies.get({ name: 'oauth_token' });
-      if (cookies.length > 0) {
+      // SECURITY FIX: only accept oauth_token scoped to soundcloud.com (prevents evil.com cookie injection).
+      const scCookies = cookies.filter(c => (c.domain || '').toLowerCase().includes('soundcloud.com'));
+      if (scCookies.length > 0) {
+        const token = (scCookies[0].value || '').trim();
+        if (!isValidTokenFormat(token)) return;
         tokenCaptured = true;
         cleanup();
-        const token = cookies[0].value;
         saveOauthToken(token);
         const profile = await fetchUserProfile(token);
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1145,6 +1486,8 @@ ipcMain.handle('open-auth-window', async () => {
           });
         }
         if (!authWindow.isDestroyed()) authWindow.close();
+        // Clear auth session storage after capture to reduce token residue
+        try { await authWindow.webContents.session.clearStorageData({ storages: ['cookies', 'localstorage'] }); } catch (_) {}
       }
     } catch (e) {
       console.error('Auth cookie check error:', e);
@@ -1152,42 +1495,52 @@ ipcMain.handle('open-auth-window', async () => {
   };
 
   authWindow.webContents.session.cookies.on('changed', (event, cookie, cause, removed) => {
-    if (!removed && cookie.name === 'oauth_token') checkToken();
+    if (!removed && cookie.name === 'oauth_token' && (cookie.domain || '').toLowerCase().includes('soundcloud.com')) checkToken();
   });
 
   checkInterval = setInterval(checkToken, 2000);
 
   authWindow.on('closed', () => {
     cleanup();
+    inMemoryToken = inMemoryToken; // keep in-memory token; session partition persists only cookies
   });
 });
 
 // Clear token & logout
 ipcMain.handle('logout', () => {
-  db.deleteToken('oauth_token');
+  try { db.deleteToken('oauth_token'); } catch (_) {}
+  inMemoryToken = null;
+  // Clear isolated auth cookies as well
+  try {
+    const ses = require('electron').session;
+    ses.fromPartition('persist:sc-auth').clearStorageData({ storages: ['cookies', 'localstorage'] }).catch(() => {});
+  } catch (_) {}
   return { loggedIn: false };
 });
 
 // Fetch active profile
 ipcMain.handle('get-auth-profile', async () => {
   const token = getOauthToken();
-  if (!token) return { loggedIn: false };
+  if (!token || !isValidTokenFormat(token)) return { loggedIn: false };
 
   const profile = await fetchUserProfile(token);
   if (profile) {
     return { loggedIn: true, profile };
   } else {
     // If token expired/invalid, clear it
-    db.deleteToken('oauth_token');
+    try { db.deleteToken('oauth_token'); } catch (_) {}
+    inMemoryToken = null;
     return { loggedIn: false };
   }
 });
 
 // Save token manually
 ipcMain.handle('save-manual-token', async (event, token) => {
-  if (!token || !token.trim()) return { loggedIn: false, error: 'Empty token.' };
+  if (typeof token !== 'string' || !token.trim()) return { loggedIn: false, error: 'Empty token.' };
+  if (token.length > 500) return { loggedIn: false, error: 'Токен слишком длинный.' };
 
   const cleanToken = token.trim();
+  if (!isValidTokenFormat(cleanToken)) return { loggedIn: false, error: 'Недействительный формат токена.' };
   const profile = await fetchUserProfile(cleanToken);
   
   if (profile) {

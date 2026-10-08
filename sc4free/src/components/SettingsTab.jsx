@@ -75,7 +75,7 @@ export default function SettingsTab({ settings, onUpdateSettings, userProfile, o
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
                   <img
-                    src={userProfile.avatar_url || 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png'}
+                    src={typeof userProfile.avatar_url === 'string' && userProfile.avatar_url.startsWith('https://') ? userProfile.avatar_url : 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png'}
                     alt="Avatar"
                     style={{ width: '40px', height: '40px', borderRadius: '50%', border: '2px solid var(--accent-color)' }}
                   />

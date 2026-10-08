@@ -230,11 +230,17 @@ export default function App() {
 
     const artistName = currentTrack.artist || currentTrack.user?.username || 'SoundCloud';
     const fallbackUrl = currentTrack.artwork_url || currentTrack.user?.avatar_url;
+    const sanitizeCover = (u) => {
+      if (!u || typeof u !== 'string') return null;
+      let v = u;
+      if (v.startsWith('http://')) v = 'https://' + v.slice('http://'.length);
+      if (!v.startsWith('https://') || v.includes('\0') || v.length > 2048) return null;
+      return v.replace('-large.jpg', '-t500x500.jpg');
+    };
     const coverUrl = currentTrack.coverPath
       ? `media://path/${encodeURIComponent(currentTrack.coverPath.replace(/\\/g, '/'))}`
-      : fallbackUrl
-        ? fallbackUrl.replace('http://', 'https://').replace('-large.jpg', '-t500x500.jpg')
-        : 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
+      : sanitizeCover(fallbackUrl)
+        || 'https://a-v2.sndcdn.com/assets/images/default/placeholder-artwork-500x500-1c39050.png';
 
     navigator.mediaSession.metadata = new MediaMetadata({
       title: currentTrack.title,
